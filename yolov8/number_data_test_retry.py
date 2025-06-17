@@ -133,7 +133,7 @@ def run_and_check(batch_frames, frame_ids, increment_checker):
             if len(str(frame_number)) > 7:
                 promote_conf = conf + 0.1
             if len(str(frame_number))<7:
-                promote_conf = conf - 0.1
+                promote_conf = conf - 0.3
             results = model.predict([frame], conf=promote_conf, verbose=False)
             re_result = process_batch_results(results,[frame_no],increment_checker=increment_checker,frames=[frame],error_retry=True)
             if isinstance(re_result, list):
