@@ -7,8 +7,10 @@ import json
 import os
 import copy
 import config
+from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=20)  # 设置并发批次数，根据CPU/GPU可调
 
 # 预加载模型（启动时加载，避免每次请求加载）
 model = YOLO(config.model_path)
@@ -133,7 +135,7 @@ def run_and_check(batch_frames, frame_ids, increment_checker):
             if len(str(frame_number)) > 7:
                 promote_conf = conf + 0.1
             if len(str(frame_number))<7:
-                promote_conf = conf - 0.3
+                promote_conf = conf - 0.5
             results = model.predict([frame], conf=promote_conf, verbose=False)
             re_result = process_batch_results(results,[frame_no],increment_checker=increment_checker,frames=[frame],error_retry=True)
             if isinstance(re_result, list):
@@ -201,23 +203,53 @@ def process_batch_results(results, frame_ids, conf_threshold=0.9, increment_chec
         all_frame_results.append({
             "frame": frame_no,
             "status": status,
-            "detections": detections
+            "result":{
+                "numbers":get_numbers(detections),
+                "detections": detections
+            }
         })
 
     return all_frame_results
 
+def get_numbers(detections):
+    main_part = detections[:-14]
+    new_number_str = ''.join(d['class'] for d in main_part)
+    new_number = int(new_number_str)
+    return new_number
+
 def detect_video(video_path,save_result_dir,video_name):
-    # 初始化
+    result_path = os.path.join(save_result_dir, f"{video_name}.json")
+    # 如果文件已存在，直接从文件或者本地map返回结果
+    if os.path.exists(result_path):
+        last_frame_result, status_info = get_last_two_lines(result_path)
+        if not last_frame_result:
+            return jsonify({"error": "读取失败"}), 500
+        local_video_status = copy.deepcopy(video_status_map)
+
+        if video_name in local_video_status:
+            local_video_status[video_name]["processed_frames"] = last_frame_result["frame"]
+            local_video_status[video_name].update({
+                "last_frame_result": last_frame_result
+            })
+            return jsonify(local_video_status[video_name])
+        else:
+            response_data = build_response(last_frame_result, status_info)
+            return jsonify(response_data)
+
+    # 文件不存在，需要初始化
     video_status_map[video_name] = {
         "detect_status": "normal",
-        "process_status":"pending",
+        "process_status":"processing",
         "processed_frames": 0,
         "total_frames": int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT))
     }
-    result_path = os.path.join(save_result_dir, f"{video_name}.json")
-    # 如果文件已存在，先删除
-    if os.path.exists(result_path):
-        os.remove(result_path)
+    # 异步执行
+    executor.submit(running_async, result_path, video_name, video_path,video_status_map[video_name])
+    return video_status_map[video_name]
+
+
+def running_async(result_path, video_name, video_path,status):
+    print(f"开始执行{video_name}检测任务....")
     # 再打开文件写入
     f_out = open(result_path, "w", encoding="utf-8")
     batch_frames = []
@@ -225,45 +257,45 @@ def detect_video(video_path,save_result_dir,video_name):
     frame_id = 0
     cap = cv2.VideoCapture(video_path)
     all_results = []
-    increment_checker = VideoIncrementChecker(tail_len=14,history_len=config.batch_size*2,retry_frame_size=config.batch_size)
-
+    increment_checker = VideoIncrementChecker(tail_len=14, history_len=config.batch_size * 2,
+                                              retry_frame_size=config.batch_size)
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        video_status_map[video_name]["process_status"] = "processing"
+        status["process_status"] = "processing"
         h = frame.shape[0]
         cropped = frame[:h // 10, :]
         batch_frames.append(cropped)
         frame_ids.append(frame_id)
         frame_id += 1
-        video_status_map[video_name]["processed_frames"] +=1
+        status["processed_frames"] += 1
 
         if len(batch_frames) == config.batch_size:
-            batch_results, success = run_and_check(batch_frames, frame_ids,increment_checker)
+            batch_results, success = run_and_check(batch_frames, frame_ids, increment_checker)
             if success is False:
-                video_status_map[video_name]["detect_status"] = "abnormal"
+                status["detect_status"] = "abnormal"
             all_results.extend(batch_results)
             # ✅ 将结果逐帧写入文件，一行一个 JSON
             for result in batch_results:
                 f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
             batch_frames = []
             frame_ids = []
-
     # 处理剩余帧
     if batch_frames:
-        batch_results, success = run_and_check(batch_frames, frame_ids,increment_checker)
+        batch_results, success = run_and_check(batch_frames, frame_ids, increment_checker)
         if success is False:
-            video_status_map[video_name]["detect_status"] = "abnormal"
+            status["detect_status"] = "abnormal"
         all_results.extend(batch_results)
         for result in batch_results:
             f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-    #视频状态结果保存
-    video_status_map[video_name]["process_status"] = "finished"
-    f_out.write(json.dumps(video_status_map[video_name], ensure_ascii=False) + "\n")
+    # 视频状态结果保存
+    status["process_status"] = "finished"
+    f_out.write(json.dumps(status, ensure_ascii=False) + "\n")
     cap.release()
     f_out.close()
-    return video_status_map[video_name]
+    if video_name in video_status_map:
+        del video_status_map[video_name]
 
 @app.route("/detect", methods=["POST"])
 def detect_api():
@@ -274,19 +306,13 @@ def detect_api():
         return jsonify({"error": "缺失参数: video_path"}), 400
     if not video_name:
         return jsonify({"error": "缺失参数: video_name"}), 400
-    #若执行状态存在,并且没有完成,实时返回执行结果
-    if video_name in video_status_map and video_status_map[video_name].get("process_status") is not None:
-        if video_status_map[video_name]["process_status"] != "finished":
-            return jsonify(video_status_map[video_name])
     result_dir = config.save_result_dir
     os.makedirs(result_dir, exist_ok=True)  # 如果不存在就创建
     full_video_path = os.path.join(video_path, video_name)
     print(f"开始处理视频{full_video_path}")
     results = detect_video(full_video_path,result_dir,video_name)
     print(f"{full_video_path}处理完成")
-    json_result =  jsonify(results)
-    del video_status_map[video_name]
-    return json_result
+    return results
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=config.port, debug=False)
