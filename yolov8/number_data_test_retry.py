@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from flask import Flask, request, jsonify
 import cv2
 
@@ -200,13 +202,13 @@ def process_batch_results(results, frame_ids, conf_threshold=0.9, increment_chec
         if increment_checker is not None:
             if not increment_checker.update(detections, frame_no=frame_no,frame=frames[i],error_retry=error_retry):
                 status = "abnormal"
+
+        number_res,time_res= get_numbers(detections)
         all_frame_results.append({
             "frame": frame_no,
             "status": status,
-            "result":{
-                "numbers":get_numbers(detections),
-                "detections": detections
-            }
+            "result":number_res,
+            "time_result":time_res
         })
 
     return all_frame_results
@@ -215,7 +217,14 @@ def get_numbers(detections):
     main_part = detections[:-14]
     new_number_str = ''.join(d['class'] for d in main_part)
     new_number = int(new_number_str)
-    return new_number
+
+    timestamp_part = detections[-14:]
+    timestamp_str = ''.join(d['class'] for d in timestamp_part)
+    # 转换为 datetime 对象
+    dt = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
+    new_dt = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    return new_number,new_dt
 
 def detect_video(video_path,save_result_dir,video_name):
     result_path = os.path.join(save_result_dir, f"{video_name}.json")
