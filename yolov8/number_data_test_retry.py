@@ -222,8 +222,8 @@ def detect_video(video_path,save_result_dir,video_name):
     # 如果文件已存在，直接从文件或者本地map返回结果
     if os.path.exists(result_path):
         last_frame_result, status_info = get_last_two_lines(result_path)
-        if not last_frame_result:
-            return jsonify({"error": "读取失败"}), 500
+        if not last_frame_result and video_name in video_status_map:
+            return video_status_map
         local_video_status = copy.deepcopy(video_status_map)
 
         if video_name in local_video_status:
