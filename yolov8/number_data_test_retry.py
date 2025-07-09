@@ -1,5 +1,8 @@
+import gc
 from datetime import datetime
+from threading import Thread
 
+import torch
 from flask import Flask, request, jsonify
 import cv2
 
@@ -10,15 +13,42 @@ import os
 import copy
 import config
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from queue import Queue
+
+@dataclass
+class DetectTask:
+    video_name: str
+    result_path: str
+    video_path: str
+    video_status: dict
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=20)  # 设置并发批次数，根据CPU/GPU可调
+
+task_queue = Queue()
 
 # 预加载模型（启动时加载，避免每次请求加载）
 model = YOLO(config.model_path)
 conf = config.confidence
 # 全局状态字典,保存每个视频的检测状态
 video_status_map = {}
+
+
+def detect_worker():
+    while True:
+        task = task_queue.get()
+        try:
+            if task is None:
+                # print("[WARN] 收到空任务，跳过处理")
+                # 标记任务完成，继续下一轮循环
+                continue
+            running_async(task.result_path, task.video_name, task.video_path, task.video_status)
+        except Exception as e:
+            print(f"[ERROR] 检测任务失败: {e}")
+        finally:
+            task_queue.task_done()
+
 
 def get_last_two_lines(result_file):
     """读取 JSONL 文件最后两行，返回解析后的 JSON 对象"""
@@ -114,6 +144,9 @@ def run_and_check(batch_frames, frame_ids, increment_checker):
     # 第一次：批量检测
     results = model.predict(batch_frames, conf=conf, verbose=False)
     batch_results = process_batch_results(results, frame_ids, increment_checker=increment_checker, frames=batch_frames)
+    #清除缓存和张量引用
+    del results
+    torch.cuda.empty_cache()
     if all(res["status"] == "normal" for res in batch_results):
         return batch_results, True
     #有问题的帧多次检测
@@ -140,6 +173,9 @@ def run_and_check(batch_frames, frame_ids, increment_checker):
                 promote_conf = conf - 0.5
             results = model.predict([frame], conf=promote_conf, verbose=False)
             re_result = process_batch_results(results,[frame_no],increment_checker=increment_checker,frames=[frame],error_retry=True)
+            # 清除缓存和张量引用
+            del results
+            torch.cuda.empty_cache()
             if isinstance(re_result, list):
                 re_result = re_result[0]
             print(f"检测结果{re_result}")
@@ -210,6 +246,7 @@ def process_batch_results(results, frame_ids, conf_threshold=0.9, increment_chec
             "result":number_res,
             "time_result":time_res
         })
+        del boxes
 
     return all_frame_results
 
@@ -252,59 +289,71 @@ def detect_video(video_path,save_result_dir,video_name):
         "processed_frames": 0,
         "total_frames": int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT))
     }
+
+    task = DetectTask(
+        video_name=video_name,
+        result_path=result_path,
+        video_path=video_path,
+        video_status=video_status_map[video_name]
+    )
+    task_queue.put(task)
     # 异步执行
-    executor.submit(running_async, result_path, video_name, video_path,video_status_map[video_name])
+    # executor.submit(running_async, result_path, video_name, video_path,video_status_map[video_name])
     return video_status_map[video_name]
 
 
 def running_async(result_path, video_name, video_path,status):
-    print(f"开始执行{video_name}检测任务....")
-    # 再打开文件写入
-    f_out = open(result_path, "w", encoding="utf-8")
-    batch_frames = []
-    frame_ids = []
-    frame_id = 0
-    cap = cv2.VideoCapture(video_path)
-    all_results = []
-    increment_checker = VideoIncrementChecker(tail_len=14, history_len=config.batch_size * 2,
-                                              retry_frame_size=config.batch_size)
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        status["process_status"] = "processing"
-        h = frame.shape[0]
-        cropped = frame[:h // 10, :]
-        batch_frames.append(cropped)
-        frame_ids.append(frame_id)
-        frame_id += 1
-        status["processed_frames"] += 1
+    try:
+        print(f"开始执行{video_name}检测任务....")
+        # 再打开文件写入
+        f_out = open(result_path, "w", encoding="utf-8")
+        batch_frames = []
+        frame_ids = []
+        frame_id = 0
+        cap = cv2.VideoCapture(video_path)
+        all_results = []
+        increment_checker = VideoIncrementChecker(tail_len=14, history_len=config.batch_size * 2,
+                                                  retry_frame_size=config.batch_size)
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            status["process_status"] = "processing"
+            h = frame.shape[0]
+            cropped = frame[:h // 10, :]
+            batch_frames.append(cropped)
+            frame_ids.append(frame_id)
+            frame_id += 1
+            status["processed_frames"] += 1
 
-        if len(batch_frames) == config.batch_size:
+            if len(batch_frames) == config.batch_size:
+                #加入队列
+                batch_results, success = run_and_check(batch_frames, frame_ids, increment_checker)
+                if success is False:
+                    status["detect_status"] = "abnormal"
+                all_results.extend(batch_results)
+                # ✅ 将结果逐帧写入文件，一行一个 JSON
+                for result in batch_results:
+                    f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
+                batch_frames = []
+                frame_ids = []
+        # 处理剩余帧
+        if batch_frames:
             batch_results, success = run_and_check(batch_frames, frame_ids, increment_checker)
             if success is False:
                 status["detect_status"] = "abnormal"
             all_results.extend(batch_results)
-            # ✅ 将结果逐帧写入文件，一行一个 JSON
             for result in batch_results:
                 f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-            batch_frames = []
-            frame_ids = []
-    # 处理剩余帧
-    if batch_frames:
-        batch_results, success = run_and_check(batch_frames, frame_ids, increment_checker)
-        if success is False:
-            status["detect_status"] = "abnormal"
-        all_results.extend(batch_results)
-        for result in batch_results:
-            f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
-    # 视频状态结果保存
-    status["process_status"] = "finished"
-    f_out.write(json.dumps(status, ensure_ascii=False) + "\n")
-    cap.release()
-    f_out.close()
-    if video_name in video_status_map:
-        del video_status_map[video_name]
+        # 视频状态结果保存
+        status["process_status"] = "finished"
+        f_out.write(json.dumps(status, ensure_ascii=False) + "\n")
+        cap.release()
+        f_out.close()
+        if video_name in video_status_map:
+            del video_status_map[video_name]
+    finally:
+        gc.collect()
 
 @app.route("/detect", methods=["POST"])
 def detect_api():
@@ -324,4 +373,5 @@ def detect_api():
     return results
 
 if __name__ == "__main__":
+    Thread(target=detect_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=config.port, debug=False)
