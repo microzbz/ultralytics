@@ -33,6 +33,7 @@ model = YOLO(config.model_path)
 conf = config.confidence
 # 全局状态字典,保存每个视频的检测状态
 video_status_map = {}
+task_set = set()  # 直接用 video_path 去重
 
 
 def detect_worker():
@@ -47,6 +48,7 @@ def detect_worker():
         except Exception as e:
             print(f"[ERROR] 检测任务失败: {e}")
         finally:
+            task_set.discard(task.video_path)  # 处理完成后释放占用
             task_queue.task_done()
 
 
@@ -289,7 +291,11 @@ def detect_video(video_path,save_result_dir,video_name):
         "processed_frames": 0,
         "total_frames": int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT))
     }
+    if video_path in task_set:
+        print(f"已存在当前{video_path}任务")
+        return video_status_map[video_name]
 
+    task_set.add(video_path)
     task = DetectTask(
         video_name=video_name,
         result_path=result_path,
